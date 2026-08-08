@@ -43,7 +43,7 @@ contract FindHookSalt is Test {
             type(DynamicFeeHook).creationCode,
             abi.encode(POOL_MANAGER),
             uint160(
-                Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG
+                Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
             )
         );
 

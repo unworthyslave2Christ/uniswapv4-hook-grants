@@ -1,14 +1,43 @@
 // BY GOD'S GRACE ALONE
 
-/**
- * @title the contract DynamicFeeHook enables increases in swap costs when volatility spikes to cushion against LVR. It is a hook that calculates the historical asset variance within the pool itself programmatically scaling the swap fee up during high volatility and down during market stability. The need for the hok stems from the fact that fixed fee tiers such as (uniswap v3's 0.05% or 0.30%) fail to protect LPs from Loss-Versus-Rebalancing (LVR) in the event of volatilities in prices, with this hook, fee generation for liquidity providers is maximized while maintaining competitive pricing during high-volume, steady-state periods, thus protecting liquidity providers from toxic arbitrage during high volatility. And indeed, this kind of hook is the most sought after in DeFi right now at it promises to to prevent LVR. It uses the onchain TWAP calculated over a short window as an oracle, using the price to calculate moving averages
- * @author 
- * @notice 
- */
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-// import {BaseHook} from "@uniswapv4-periphery/src/base/"
+/**
+ * @title DynamicFeeHook
+ *
+ * @notice
+ * Dynamically adjusts the Uniswap v4 LP fee according to recent pool
+ * price movement.
+ *
+ * The hook maintains an exponentially weighted moving average (EWMA)
+ * of observed tick movement:
+ *
+ *      swap
+ *        ↓
+ *   beforeSwap()
+ *        ↓
+ *   apply fee based on
+ *   previously observed volatility
+ *        ↓
+ *      swap
+ *        ↓
+ *    afterSwap()
+ *        ↓
+ *   observe actual tick movement
+ *        ↓
+ *   update volatility metric
+ *        ↓
+ *   determine fee for next swap
+ *
+ * During calm markets, the fee approaches MIN_FEE.
+ *
+ * During periods of increasing price movement, the fee increases
+ * progressively toward MAX_FEE.
+ *
+ * The objective is to provide LPs with additional fee compensation
+ * during periods when adverse selection and LVR risk are elevated.
+ */
 
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {SwapParams} from "v4-core/src/types/PoolOperation.sol";
@@ -16,83 +45,193 @@ import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
-import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "v4-core/src/types/BeforeSwapDelta.sol";
+import {
+    BeforeSwapDelta,
+    BeforeSwapDeltaLibrary
+} from "v4-core/src/types/BeforeSwapDelta.sol";
 import {LPFeeLibrary} from "v4-core/src/libraries/LPFeeLibrary.sol";
 import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
+import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
+
 
 contract DynamicFeeHook {
-    /*///////////////////////////////////////////////////////////
+
+    /*//////////////////////////////////////////////////////////////
                                 ERRORS
-    //////////////////////////////////////////////////////////*/
+    //////////////////////////////////////////////////////////////*/
+
     error DynamicFeeHook__NotPoolManager();
 
-    /*///////////////////////////////////////////////////////////
-                         LIBRARY USAGE
-    //////////////////////////////////////////////////////////*/
-    using LPFeeLibrary for uint24;
+    /*//////////////////////////////////////////////////////////////
+                                LIBRARIES
+    //////////////////////////////////////////////////////////////*/
+
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
 
-    /*///////////////////////////////////////////////////////////
-                         STATE VARIABLES
-    //////////////////////////////////////////////////////////*/
+    /*//////////////////////////////////////////////////////////////
+                            STATE VARIABLES
+    //////////////////////////////////////////////////////////////*/
+
     IPoolManager public immutable poolManager;
 
-    // Keep track of the last block timestamp a swap occured to calculate time gaps
+    /**
+     * @notice Last pool tick observed by the hook.
+     *
+     * This is updated after each completed swap.
+     */
     mapping(bytes32 => int24) public lastObservedTick;
 
-    // Track an internal moving average or "heat index" of volatility per pool
-    mapping (bytes32 => uint256) public poolMovingVolatility;
+    /**
+     * @notice EWMA volatility metric for each pool.
+     *
+     * The metric is stored with VOLATILITY_SCALE precision.
+     */
+    mapping(bytes32 => uint256) public poolMovingVolatility;
 
-    // architectural constraints for Uniswap v4 fees
-    uint24 public constant BASE_FEE = 3000;         // 0.30% standard fee
-    uint24 public constant MAX_FEE = 50000;         // 5.00% ceiling to prevent LVR during crashes
-    uint24 public constant MIN_FEE = 500;           // 0.05% floor for stable, high-volume periods 
-    uint256 public constant SMOOTHING_FACTOR = 8; // Decay parameter for the volatility metric
+    /**
+     * @notice Fee that was selected for the most recent swap.
+     *
+     * This is primarily useful for observability and testing.
+     */
+    mapping(bytes32 => uint24) public lastAppliedFee;
 
-    /*///////////////////////////////////////////////////////////
-                         MODIFIERS
-    //////////////////////////////////////////////////////////*/
-    modifier onlyPoolManager(){
-        if (msg.sender != address(poolManager)) revert DynamicFeeHook__NotPoolManager();
+    /**
+     * @notice Number of swaps observed by the hook.
+     *
+     * Useful for testing and monitoring.
+     */
+    mapping(bytes32 => uint256) public swapCount;
+
+    /*//////////////////////////////////////////////////////////////
+                              FEE PARAMETERS
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @dev 0.30%.
+     */
+    uint24 public constant BASE_FEE = 3000;
+
+    /**
+     * @dev 5.00%.
+     */
+    uint24 public constant MAX_FEE = 50000;
+
+    /**
+     * @dev 0.05%.
+     */
+    uint24 public constant MIN_FEE = 500;
+
+    /**
+     * @dev EWMA smoothing parameter.
+     *
+     * Larger values make the volatility response smoother.
+     */
+    uint256 public constant SMOOTHING_FACTOR = 8;
+
+    /**
+     * @dev Fixed-point precision for the volatility metric.
+     *
+     * This prevents small tick movements from being lost because
+     * Solidity performs integer division.
+     */
+    uint256 public constant VOLATILITY_SCALE = 1e6;
+
+    /**
+     * @dev Determines how aggressively volatility translates
+     * into fee increases.
+     *
+     * The value is expressed against VOLATILITY_SCALE.
+     */
+    uint256 public constant FEE_SENSITIVITY = 120;
+
+    /*//////////////////////////////////////////////////////////////
+                                EVENTS
+    //////////////////////////////////////////////////////////////*/
+
+    event VolatilityUpdated(
+        bytes32 indexed poolId,
+        int24 previousTick,
+        int24 currentTick,
+        uint256 tickMovement,
+        uint256 volatility
+    );
+
+    event DynamicFeeApplied(
+        bytes32 indexed poolId,
+        uint24 fee,
+        uint256 volatility
+    );
+
+    /*//////////////////////////////////////////////////////////////
+                              MODIFIERS
+    //////////////////////////////////////////////////////////////*/
+
+    modifier onlyPoolManager() {
+        if (msg.sender != address(poolManager)) {
+            revert DynamicFeeHook__NotPoolManager();
+        }
+
         _;
     }
 
-    /*///////////////////////////////////////////////////////////
-                         FUNCTIONS
-    //////////////////////////////////////////////////////////*/
-    // address private immutable pool
-    constructor(address _poolManager){
+    /*//////////////////////////////////////////////////////////////
+                              CONSTRUCTOR
+    //////////////////////////////////////////////////////////////*/
+
+    constructor(address _poolManager) {
         poolManager = IPoolManager(_poolManager);
-        Hooks.validateHookPermissions(IHooks(address(this)), getHookPermissions());
+
+        Hooks.validateHookPermissions(
+            IHooks(address(this)),
+            getHookPermissions()
+        );
     }
 
+    /*//////////////////////////////////////////////////////////////
+                         HOOK PERMISSIONS
+    //////////////////////////////////////////////////////////////*/
 
-    // 1. Telling the PoolManager which lifecycle functions this hook uses
-    function getHookPermissions() 
-        public 
-        pure 
+    function getHookPermissions()
+        public
+        pure
         returns (Hooks.Permissions memory)
     {
         return Hooks.Permissions({
             beforeInitialize: false,
-            afterInitialize: true, // it is a must to initialize the baseline tick tracking state
+
+            afterInitialize: true,
+
             beforeAddLiquidity: false,
             afterAddLiquidity: false,
+
             beforeRemoveLiquidity: false,
             afterRemoveLiquidity: false,
-            beforeSwap: true, // only intercept this hook before the swap happens
-            afterSwap: false,
+
+            beforeSwap: true,
+            afterSwap: true,
+
             beforeDonate: false,
             afterDonate: false,
+
             beforeSwapReturnDelta: false,
             afterSwapReturnDelta: false,
+
             afterAddLiquidityReturnDelta: false,
             afterRemoveLiquidityReturnDelta: false
         });
     }
 
-    // captures the initial slot0 price data when the pool is created
+    /*//////////////////////////////////////////////////////////////
+                         AFTER INITIALIZE
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Stores the initial pool tick.
+     *
+     * This gives the hook a reference point from which future
+     * price movement can be measured.
+     */
     function afterInitialize(
         address,
         PoolKey calldata key,
@@ -101,80 +240,204 @@ contract DynamicFeeHook {
     )
         external
         onlyPoolManager
-    returns (bytes4){
+        returns (bytes4)
+    {
         bytes32 poolId = PoolId.unwrap(key.toId());
+
         lastObservedTick[poolId] = tick;
+
+        poolMovingVolatility[poolId] = 0;
+
+        lastAppliedFee[poolId] = MIN_FEE;
+
         return IHooks.afterInitialize.selector;
     }
 
+    /*//////////////////////////////////////////////////////////////
+                            BEFORE SWAP
+    //////////////////////////////////////////////////////////////*/
 
-    // The actual hook to execute right before a user swap occurs
+    /**
+     * @notice Selects the fee for the current swap.
+     *
+     * IMPORTANT:
+     *
+     * beforeSwap executes before the current swap changes the pool
+     * price. Therefore, this function uses the volatility measured
+     * from previous swaps.
+     */
     function beforeSwap(
         address,
         PoolKey calldata key,
         IPoolManager.SwapParams calldata,
         bytes calldata
-    ) 
+    )
         external
         onlyPoolManager
-    returns (bytes4, BeforeSwapDelta, uint24){
+        returns (
+            bytes4,
+            BeforeSwapDelta,
+            uint24
+        )
+    {
         bytes32 poolId = PoolId.unwrap(key.toId());
 
-        // fetch current pool tick directly from v4 pool  slot0 for given poolId
-        (, int24 currentTick, , ) = poolManager.getSlot0(PoolId.wrap(poolId));
+        uint256 volatility =
+            poolMovingVolatility[poolId];
 
-        // computing the absolute variance between trades
-        int24 tickDelta = currentTick - lastObservedTick[poolId];
-        uint256 absDelta = tickDelta >= 0 ? uint256(int256(tickDelta)) : uint256(int256(-tickDelta));
-        
-        // updating the exponential moving average of pool variance
-        uint256 currentVolatility = poolMovingVolatility[poolId];
-        uint256 updatedVolatility = ((currentVolatility * (SMOOTHING_FACTOR - 1)) + absDelta) / SMOOTHING_FACTOR;
-        poolMovingVolatility[poolId] = updatedVolatility;
+        uint24 dynamicFee =
+            calculateVolatilityFee(volatility);
 
-        // updating memory state for next incoming swap execution
-        lastObservedTick[poolId] = currentTick;
+        lastAppliedFee[poolId] = dynamicFee;
 
-        // calculate fee based on active variance
-        uint24 dynamicFee = calculateVolatilityFee(updatedVolatility);
-        
-        // returning the function selector and pass the dynamic fee to the PoolManager 
-        // The LPFeeLibrary.DYNAMIC_FEE_FLAG tells uniswap to override the standard fee
-        return(
+        emit DynamicFeeApplied(
+            poolId,
+            dynamicFee,
+            volatility
+        );
+
+        return (
             IHooks.beforeSwap.selector,
             BeforeSwapDeltaLibrary.ZERO_DELTA,
-            dynamicFee | LPFeeLibrary.DYNAMIC_FEE_FLAG
+
+            // Tell PoolManager to use our dynamic LP fee.
+            dynamicFee | LPFeeLibrary.OVERRIDE_FEE_FLAG
         );
     }
 
-    // updatePlanName(uint256 planId, string calldata newName) 
-    // updatePlanAmount(uint256 planId, uint256 newAmount)
-    // updatePlanInterval(uint256 planId, uint256 newInterval)
-    // updatePlanPaymentToken(uint256 planId, address newToken) 
-    // updateTrialPeriod(uint256 planId, uint64 newTrialPeriod)
-    // updateMaxSubscribers(uint256 planId, uint32 maxSubscribers)
-    // setAutoRenewal(uint256 planId, bool enabled)
+    /*//////////////////////////////////////////////////////////////
+                             AFTER SWAP
+    //////////////////////////////////////////////////////////////*/
 
-    // internal math logic for volatility calculation: converts price moves into fee tiers
+    /**
+     * @notice Measures the price movement caused by the completed swap.
+     *
+     * This is deliberately performed after the swap so that the hook
+     * measures the actual price movement rather than trying to predict
+     * it before execution.
+     */
+    function afterSwap(
+        address,
+        PoolKey calldata key,
+        IPoolManager.SwapParams calldata,
+        BalanceDelta,
+        bytes calldata
+    )
+        external
+        onlyPoolManager
+        returns (bytes4, int128)
+    {
+        bytes32 poolId = PoolId.unwrap(key.toId());
+
+        // Read the pool tick after the swap has actually executed.
+        (
+            ,
+            int24 currentTick,
+            ,
+        ) = poolManager.getSlot0(
+            PoolId.wrap(poolId)
+        );
+
+        int24 previousTick = lastObservedTick[poolId];
+
+        // Measure the absolute price movement caused by this swap.
+        int256 tickDelta =
+            int256(currentTick) -
+            int256(previousTick);
+
+        uint256 absoluteTickMovement =
+            tickDelta >= 0
+                ? uint256(tickDelta)
+                : uint256(-tickDelta);
+
+        // Read the previous EWMA volatility.
+        uint256 previousVolatility =
+            poolMovingVolatility[poolId];
+
+        /*
+        * Update the exponentially weighted moving average.
+        *
+        * The VOLATILITY_SCALE preserves precision when the observed
+        * tick movement is small.
+        */
+        uint256 updatedVolatility =
+            (
+                previousVolatility *
+                (SMOOTHING_FACTOR - 1)
+                +
+                absoluteTickMovement *
+                VOLATILITY_SCALE
+            )
+            / SMOOTHING_FACTOR;
+
+        poolMovingVolatility[poolId] =
+            updatedVolatility;
+
+        // This tick becomes the reference point for the next swap.
+        lastObservedTick[poolId] =
+            currentTick;
+
+        swapCount[poolId]++;
+
+        emit VolatilityUpdated(
+            poolId,
+            previousTick,
+            currentTick,
+            absoluteTickMovement,
+            updatedVolatility
+        );
+
+        return (
+            IHooks.afterSwap.selector,
+            0
+        );
+    }
+    /*//////////////////////////////////////////////////////////////
+                         FEE CALCULATION
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Converts the volatility metric into an LP fee.
+     *
+     * The volatility metric is fixed-point scaled by 1e6.
+     *
+     * A zero-volatility pool receives MIN_FEE.
+     *
+     * As volatility increases, the fee moves progressively upward.
+     *
+     * MAX_FEE acts as a hard safety ceiling.
+     */
     function calculateVolatilityFee(
         uint256 volatilityMetric
-    ) 
-        internal 
-        pure 
-    returns (uint24){
-        if (volatilityMetric == 0) return MIN_FEE;
+    )
+        public
+        pure
+        returns (uint24)
+    {
+        if (volatilityMetric == 0) {
+            return MIN_FEE;
+        }
 
-        // scale fee proportionally to moving volatility
-        // For example, every unit of tick volatility adds roughly 0.01% (100 units) to the fee
-        uint256 calculatedFee = BASE_FEE + (volatilityMetric * 120);
+        uint256 feeIncrease =
+            (
+                volatilityMetric *
+                FEE_SENSITIVITY
+            )
+            /
+            VOLATILITY_SCALE;
 
-        // If arbitrageurs are driving the price violently across multiple blocks, the updatedVolatility metric explodes/increases/balloons rapidly, the fee aggressively hits the celing MAX_FEE, absorbing the arbitrage peofit and keeping that value trapped inside the pool for LPs
+        uint256 calculatedFee =
+            BASE_FEE +
+            feeIncrease;
 
-        if (calculatedFee > MAX_FEE) return MAX_FEE;
+        if (calculatedFee >= MAX_FEE) {
+            return MAX_FEE;
+        }
 
-        // when market price randomness(noise) dies down and price deviation shrink, the exponential movinf average nativel pulls down to MIN_FEE,
-        if (calculatedFee < MIN_FEE) return MIN_FEE;
+        if (calculatedFee <= MIN_FEE) {
+            return MIN_FEE;
+        }
+
+        return uint24(calculatedFee);
     }
-
-    
 }
