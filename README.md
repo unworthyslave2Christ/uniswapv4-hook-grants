@@ -649,9 +649,7 @@ A key next step is integrating an **on-chain Time-Weighted Average Price (TWAP)*
 
 The current implementation measures:
 
-[
-|\Delta Tick| = |Tick_{current} - Tick_{previous}|
-]
+∣ΔTick∣=∣Tickcurrent​−Tickprevious​∣
 
 While this is inexpensive and responsive, it does not explicitly account for **time**. A 100-tick movement occurring within one second and the same movement occurring over several minutes would currently be treated similarly.
 
