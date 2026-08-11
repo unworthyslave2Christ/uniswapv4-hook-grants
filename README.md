@@ -4,8 +4,10 @@ Welcome to the **Modular LP Protection & Yield Suite** repository. This workspac
 
 ### 🛠 Project Structure
 
-```text
+### 🛠 Project Structure
 
+```text
+.
 ├── src/
 │   ├── DynamicFeeHook.sol                 # Hook 1: Anti-LVR Price Variance Engine
 │   ├── MEVInternalizerHook.sol            # Hook 2: Intra-Block Sandwich Neutralizer
@@ -23,9 +25,10 @@ Welcome to the **Modular LP Protection & Yield Suite** repository. This workspac
 │   └── MEVInternalizerHookProposalComprehensive.md
 ├── foundry.toml
 └── README.md                              # Workspace Root Manifest
+```
 
 Use code with caution.
-```
+
 
 ### 🚀 Core Component Architecture
 
