@@ -4,7 +4,7 @@ Welcome to the **Modular LP Protection & Yield Suite** repository. This workspac
 
 ### 🛠 Project Structure
 
-text
+```text
 
 ├── src/
 │   ├── DynamicFeeHook.sol                 # Hook 1: Anti-LVR Price Variance Engine
@@ -25,6 +25,7 @@ text
 └── README.md                              # Workspace Root Manifest
 
 Use code with caution.
+```
 
 ### 🚀 Core Component Architecture
 
