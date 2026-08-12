@@ -42,13 +42,13 @@ Use code with caution.
 
 * **Core Utility:** Deters sandwich bots and internalizes MEV revenue.
 * **Methodology:** Monopolizes intra-block sequencing metrics. Any subsequent trade hitting the pool inside the exact same block triggers a 1.50% premium penalty, returning the value directly to the pool assets.
-* **Status:** Testing Validated ✅ [View Proposal Brief](./proposals/MEVInternalizerHookProposalBrief.md)
+* **Status:** Testing NOT YET Validated ✅ [View Proposal Brief](./proposals/MEVInternalizerHookProposalBrief.md)
 
 ### 3. Idle Capital Hook
 
 * **Core Utility:** Unlocks yield generation for out-of-range concentrated liquidity positions.
 * **Methodology:** Implements a custom accounting mechanism that routes 90% of inactive token balances to ERC-4626 lending vaults while holding a 10% asset buffer inside the manager for gas-friendly everyday retail routing.
-* **Status:** Testing Validated ✅ [View Proposal Brief](./proposals/IdleCapitalHookProposalBrief.md)
+* **Status:** Testing NOT YET Validated ✅ [View Proposal Brief](./proposals/IdleCapitalHookProposalBrief.md)
 
 ### 💻 Local Testing Lifecycle
 
