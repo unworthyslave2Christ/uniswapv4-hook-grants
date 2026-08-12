@@ -9,7 +9,7 @@ Welcome to the **Modular LP Protection & Yield Suite** repository. This workspac
 ```text
 
 ├── src/
-│   ├── DynamicFeeHook.sol                 # Hook 1: Anti-LVR Price Variance Engine
+│   ├── DynamicFeeHook.sol                 # Hook 1: Anti-LVR Price Variance Engine (The only tested Hook at the moment)
 │   ├── MEVInternalizerHook.sol            # Hook 2: Intra-Block Sandwich Neutralizer
 │   └── IdleCapitalHook.sol                # Hook 3: ERC-4626 Sovereign Yield Aggregator
 ├── test/
@@ -32,7 +32,7 @@ Use code with caution.
 
 ### 🚀 Core Component Architecture
 
-### 1. Volatility-Adjusted Dynamic Fee Hook
+### 1. Volatility-Adjusted Dynamic Fee Hook (The only tested Hook at the moment)
 
 * **Core Utility:** Prevents arbitrage leakage during high-volatility price discovery.
 * **Methodology:** Uses an on-chain Exponential Moving Average (EMA) to compute price variance directly from PoolManager.getSlot0() and scales fees up to 5.00% to offset LVR.
